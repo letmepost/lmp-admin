@@ -26,3 +26,16 @@ export function getSql(): postgres.Sql {
   globalForDb.__lmpSql = client;
   return client;
 }
+
+// Run a set of queries inside a single read-only transaction. `SET TRANSACTION
+// READ ONLY` is the hard safety net — any accidental write throws.
+export async function readonly<T>(
+  fn: (tx: postgres.TransactionSql) => Promise<T>,
+): Promise<T> {
+  return getSql().begin(async (tx) => {
+    await tx`SET TRANSACTION READ ONLY`;
+    // Cap any single query so a bad plan can't hang a page request.
+    await tx`SET LOCAL statement_timeout = 15000`;
+    return fn(tx);
+  }) as Promise<T>;
+}

@@ -1,39 +1,48 @@
 import "server-only";
-import { getSql } from "@/lib/db";
+import { readonly } from "@/lib/db";
+import type { Range } from "@/lib/range";
 
-// All product metrics, computed in ONE read-only transaction. `SET TRANSACTION
-// READ ONLY` is the hard safety net: any accidental write throws instead of
-// touching production. Queries run sequentially on the reserved connection.
+// All product metrics + entity detail queries. Every function runs inside a
+// single read-only transaction (see lib/db `readonly`), and issues its
+// independent queries concurrently via Promise.all. Because they share one
+// reserved connection, postgres-js pipelines them — ~1 network round trip for
+// the whole batch instead of one per query, while the transaction keeps them
+// read-only and consistent.
 //
-// Schema notes (from letmepost.dev/apps/api/src/db/schema):
-//   - "user" is a reserved word -> always quoted.
-//   - No soft-deletes anywhere.
-//   - posts.status drives success/failure. Platform for a post comes from
-//     posts.account_id -> platform_accounts.platform (account_id is nullable
-//     ON DELETE SET NULL, so deleted-account posts are "unattributed").
-//   - posts have no user_id -> "active users" is session-based only.
+// Dashboard "flow" metrics are scoped to the date range; "stock" totals are
+// cumulative.
+//
+// Schema notes: "user" is reserved (quoted). No soft-deletes. posts.status
+// drives success/failure. Platform for a post = posts.account_id ->
+// platform_accounts.platform (nullable ON DELETE SET NULL -> "unattributed").
+// posts have no user_id, so activity is org-grained; "active users" is
+// session-based.
 
+type Row = Record<string, unknown>;
 const num = (v: unknown): number => (v == null ? 0 : Number(v));
+const str = (v: unknown): string => (v == null ? "" : String(v));
+const strn = (v: unknown): string | null => (v == null ? null : String(v));
+const bool = (v: unknown): boolean => v === true || v === "t" || v === "true";
+
+/* ------------------------------- types ------------------------------- */
 
 export type Kpis = {
   totalUsers: number;
-  newUsersToday: number;
-  newUsers7d: number;
-  newUsers30d: number;
   totalOrgs: number;
   totalAccounts: number;
-  totalPosts: number;
-  posts7d: number;
+  liveSessions: number;
+  newUsers: number;
+  postsCreated: number;
   published: number;
   failed: number;
   successRate: number | null;
-  activeUsers7d: number;
-  liveSessions: number;
+  activeUsers: number;
 };
 
 export type DailyPoint = { day: string; count: number };
 export type PostsDailyPoint = { day: string; created: number; published: number };
 export type NameCount = { name: string; count: number };
+export type OrgCount = { id: string; name: string; count: number };
 export type StatusCount = { status: string; count: number };
 export type PostsPerPlatform = { platform: string; count: number };
 export type AccountsPerPlatform = { platform: string; total: number; expired: number };
@@ -49,171 +58,513 @@ export type DashboardData = {
   unattributedPosts: number;
   accountsPerPlatform: AccountsPerPlatform[];
   planDistribution: PlanCount[];
-  topOrgs: NameCount[];
+  topOrgs: OrgCount[];
   topErrors: NameCount[];
   signupAttribution: NameCount[];
   monthlyUsage: MonthlyUsage[];
 };
 
-type Row = Record<string, string | number | null>;
+/* ----------------------------- dashboard ----------------------------- */
 
-export async function getDashboardData(): Promise<DashboardData> {
-  return getSql().begin(async (tx) => {
-    await tx`SET TRANSACTION READ ONLY`;
+export async function getDashboardData(range: Range): Promise<DashboardData> {
+  const { from, to, bucket, step } = range;
 
-    const kpi = (
-      await tx<Row[]>`
+  return readonly(async (tx) => {
+    const [
+      kpiRows,
+      signups,
+      posts,
+      statusBreakdown,
+      postsPerPlatform,
+      unattributedRows,
+      accountsPerPlatform,
+      planDistribution,
+      topOrgs,
+      topErrors,
+      signupAttribution,
+      monthlyUsage,
+    ] = await Promise.all([
+      tx<Row[]>`
         SELECT
           (SELECT count(*) FROM "user") AS total_users,
-          (SELECT count(*) FROM "user" WHERE created_at >= date_trunc('day', now())) AS new_users_today,
-          (SELECT count(*) FROM "user" WHERE created_at >= now() - interval '7 days') AS new_users_7d,
-          (SELECT count(*) FROM "user" WHERE created_at >= now() - interval '30 days') AS new_users_30d,
           (SELECT count(*) FROM organization) AS total_orgs,
           (SELECT count(*) FROM platform_accounts) AS total_accounts,
-          (SELECT count(*) FROM posts) AS total_posts,
-          (SELECT count(*) FROM posts WHERE created_at >= now() - interval '7 days') AS posts_7d,
-          (SELECT count(*) FROM posts WHERE status = 'published') AS published,
-          (SELECT count(*) FROM posts WHERE status IN ('failed','rejected')) AS failed,
-          (SELECT count(DISTINCT user_id) FROM session WHERE updated_at >= now() - interval '7 days') AS active_users_7d,
-          (SELECT count(*) FROM session WHERE expires_at > now()) AS live_sessions
-      `
-    )[0];
+          (SELECT count(*) FROM session WHERE expires_at > now()) AS live_sessions,
+          (SELECT count(*) FROM "user" WHERE created_at >= ${from} AND created_at <= ${to}) AS new_users,
+          (SELECT count(*) FROM posts WHERE created_at >= ${from} AND created_at <= ${to}) AS posts_created,
+          (SELECT count(*) FROM posts WHERE status = 'published' AND created_at >= ${from} AND created_at <= ${to}) AS published,
+          (SELECT count(*) FROM posts WHERE status IN ('failed','rejected') AND created_at >= ${from} AND created_at <= ${to}) AS failed,
+          (SELECT count(DISTINCT user_id) FROM session WHERE updated_at >= ${from} AND updated_at <= ${to}) AS active_users
+      `,
+      tx<Row[]>`
+        WITH b AS (
+          SELECT gs AS bucket_start
+          FROM generate_series(
+            date_trunc(${bucket}, ${from}::timestamptz),
+            date_trunc(${bucket}, ${to}::timestamptz),
+            ${step}::interval
+          ) gs
+        ),
+        s AS (
+          SELECT date_trunc(${bucket}, created_at) AS bucket_start, count(*) AS n
+          FROM "user" WHERE created_at >= ${from} AND created_at <= ${to} GROUP BY 1
+        )
+        SELECT b.bucket_start::date::text AS day, coalesce(s.n, 0) AS count
+        FROM b LEFT JOIN s ON s.bucket_start = b.bucket_start ORDER BY b.bucket_start
+      `,
+      tx<Row[]>`
+        WITH b AS (
+          SELECT gs AS bucket_start
+          FROM generate_series(
+            date_trunc(${bucket}, ${from}::timestamptz),
+            date_trunc(${bucket}, ${to}::timestamptz),
+            ${step}::interval
+          ) gs
+        ),
+        c AS (
+          SELECT date_trunc(${bucket}, created_at) AS bucket_start, count(*) AS n
+          FROM posts WHERE created_at >= ${from} AND created_at <= ${to} GROUP BY 1
+        ),
+        p AS (
+          SELECT date_trunc(${bucket}, published_at) AS bucket_start, count(*) AS n
+          FROM posts WHERE status = 'published' AND published_at >= ${from} AND published_at <= ${to} GROUP BY 1
+        )
+        SELECT b.bucket_start::date::text AS day, coalesce(c.n, 0) AS created, coalesce(p.n, 0) AS published
+        FROM b
+        LEFT JOIN c ON c.bucket_start = b.bucket_start
+        LEFT JOIN p ON p.bucket_start = b.bucket_start
+        ORDER BY b.bucket_start
+      `,
+      tx<Row[]>`
+        SELECT status, count(*) AS count FROM posts
+        WHERE created_at >= ${from} AND created_at <= ${to}
+        GROUP BY status ORDER BY count DESC
+      `,
+      tx<Row[]>`
+        SELECT pa.platform, count(*) AS count
+        FROM posts p JOIN platform_accounts pa ON pa.id = p.account_id
+        WHERE p.created_at >= ${from} AND p.created_at <= ${to}
+        GROUP BY pa.platform ORDER BY count DESC
+      `,
+      tx<Row[]>`
+        SELECT count(*) AS count FROM posts
+        WHERE account_id IS NULL AND created_at >= ${from} AND created_at <= ${to}
+      `,
+      tx<Row[]>`
+        SELECT platform,
+          count(*) AS total,
+          count(*) FILTER (WHERE token_expires_at IS NOT NULL AND token_expires_at < now()) AS expired
+        FROM platform_accounts GROUP BY platform ORDER BY total DESC
+      `,
+      tx<Row[]>`
+        SELECT tier, count(*) AS count FROM billing_subscriptions GROUP BY tier ORDER BY count DESC
+      `,
+      tx<Row[]>`
+        SELECT o.id, o.name, count(p.id) AS count
+        FROM organization o
+        JOIN posts p ON p.organization_id = o.id AND p.created_at >= ${from} AND p.created_at <= ${to}
+        GROUP BY o.id, o.name ORDER BY count DESC LIMIT 10
+      `,
+      tx<Row[]>`
+        SELECT coalesce(error_code, '(unknown)') AS name, count(*) AS count
+        FROM post_attempts
+        WHERE succeeded = false AND started_at >= ${from} AND started_at <= ${to}
+        GROUP BY error_code ORDER BY count DESC LIMIT 10
+      `,
+      tx<Row[]>`
+        SELECT coalesce(signup_source, '(none)') AS name, count(*) AS count
+        FROM "user" WHERE created_at >= ${from} AND created_at <= ${to}
+        GROUP BY signup_source ORDER BY count DESC LIMIT 10
+      `,
+      tx<Row[]>`
+        SELECT period, sum(posts_count) AS count
+        FROM billing_usage GROUP BY period ORDER BY period DESC LIMIT 6
+      `,
+    ]);
 
+    const kpi = kpiRows[0];
     const published = num(kpi.published);
     const failed = num(kpi.failed);
     const terminal = published + failed;
 
     const kpis: Kpis = {
       totalUsers: num(kpi.total_users),
-      newUsersToday: num(kpi.new_users_today),
-      newUsers7d: num(kpi.new_users_7d),
-      newUsers30d: num(kpi.new_users_30d),
       totalOrgs: num(kpi.total_orgs),
       totalAccounts: num(kpi.total_accounts),
-      totalPosts: num(kpi.total_posts),
-      posts7d: num(kpi.posts_7d),
+      liveSessions: num(kpi.live_sessions),
+      newUsers: num(kpi.new_users),
+      postsCreated: num(kpi.posts_created),
       published,
       failed,
       successRate: terminal > 0 ? published / terminal : null,
-      activeUsers7d: num(kpi.active_users_7d),
-      liveSessions: num(kpi.live_sessions),
+      activeUsers: num(kpi.active_users),
     };
-
-    const signups = await tx<Row[]>`
-      WITH days AS (
-        SELECT d::date AS day
-        FROM generate_series(date_trunc('day', now()) - interval '29 days', date_trunc('day', now()), interval '1 day') d
-      ),
-      s AS (
-        SELECT created_at::date AS day, count(*) AS n
-        FROM "user" WHERE created_at >= now() - interval '30 days' GROUP BY 1
-      )
-      SELECT days.day::text AS day, coalesce(s.n, 0) AS count
-      FROM days LEFT JOIN s ON s.day = days.day ORDER BY days.day
-    `;
-
-    const posts = await tx<Row[]>`
-      WITH days AS (
-        SELECT d::date AS day
-        FROM generate_series(date_trunc('day', now()) - interval '29 days', date_trunc('day', now()), interval '1 day') d
-      ),
-      created AS (
-        SELECT created_at::date AS day, count(*) AS n
-        FROM posts WHERE created_at >= now() - interval '30 days' GROUP BY 1
-      ),
-      pub AS (
-        SELECT published_at::date AS day, count(*) AS n
-        FROM posts WHERE status = 'published' AND published_at >= now() - interval '30 days' GROUP BY 1
-      )
-      SELECT days.day::text AS day, coalesce(created.n, 0) AS created, coalesce(pub.n, 0) AS published
-      FROM days
-      LEFT JOIN created ON created.day = days.day
-      LEFT JOIN pub ON pub.day = days.day
-      ORDER BY days.day
-    `;
-
-    const statusBreakdown = await tx<Row[]>`
-      SELECT status, count(*) AS count FROM posts GROUP BY status ORDER BY count DESC
-    `;
-
-    const postsPerPlatform = await tx<Row[]>`
-      SELECT pa.platform, count(*) AS count
-      FROM posts p JOIN platform_accounts pa ON pa.id = p.account_id
-      GROUP BY pa.platform ORDER BY count DESC
-    `;
-
-    const unattributed = (
-      await tx<Row[]>`SELECT count(*) AS count FROM posts WHERE account_id IS NULL`
-    )[0];
-
-    const accountsPerPlatform = await tx<Row[]>`
-      SELECT platform,
-        count(*) AS total,
-        count(*) FILTER (WHERE token_expires_at IS NOT NULL AND token_expires_at < now()) AS expired
-      FROM platform_accounts GROUP BY platform ORDER BY total DESC
-    `;
-
-    const planDistribution = await tx<Row[]>`
-      SELECT tier, count(*) AS count FROM billing_subscriptions GROUP BY tier ORDER BY count DESC
-    `;
-
-    const topOrgs = await tx<Row[]>`
-      SELECT o.name, count(p.id) AS count
-      FROM organization o JOIN posts p ON p.organization_id = o.id
-      GROUP BY o.id, o.name ORDER BY count DESC LIMIT 10
-    `;
-
-    const topErrors = await tx<Row[]>`
-      SELECT coalesce(error_code, '(unknown)') AS name, count(*) AS count
-      FROM post_attempts WHERE succeeded = false
-      GROUP BY error_code ORDER BY count DESC LIMIT 10
-    `;
-
-    const signupAttribution = await tx<Row[]>`
-      SELECT coalesce(signup_source, '(none)') AS name, count(*) AS count
-      FROM "user" GROUP BY signup_source ORDER BY count DESC LIMIT 10
-    `;
-
-    const monthlyUsage = await tx<Row[]>`
-      SELECT period, sum(posts_count) AS count
-      FROM billing_usage GROUP BY period ORDER BY period DESC LIMIT 6
-    `;
 
     return {
       kpis,
-      signupsDaily: signups.map((r) => ({ day: String(r.day), count: num(r.count) })),
+      signupsDaily: signups.map((r) => ({ day: str(r.day), count: num(r.count) })),
       postsDaily: posts.map((r) => ({
-        day: String(r.day),
+        day: str(r.day),
         created: num(r.created),
         published: num(r.published),
       })),
-      statusBreakdown: statusBreakdown.map((r) => ({
-        status: String(r.status),
-        count: num(r.count),
-      })),
-      postsPerPlatform: postsPerPlatform.map((r) => ({
-        platform: String(r.platform),
-        count: num(r.count),
-      })),
-      unattributedPosts: num(unattributed.count),
+      statusBreakdown: statusBreakdown.map((r) => ({ status: str(r.status), count: num(r.count) })),
+      postsPerPlatform: postsPerPlatform.map((r) => ({ platform: str(r.platform), count: num(r.count) })),
+      unattributedPosts: num(unattributedRows[0].count),
       accountsPerPlatform: accountsPerPlatform.map((r) => ({
-        platform: String(r.platform),
+        platform: str(r.platform),
         total: num(r.total),
         expired: num(r.expired),
       })),
-      planDistribution: planDistribution.map((r) => ({
-        tier: String(r.tier),
-        count: num(r.count),
-      })),
-      topOrgs: topOrgs.map((r) => ({ name: String(r.name ?? "(unnamed)"), count: num(r.count) })),
-      topErrors: topErrors.map((r) => ({ name: String(r.name), count: num(r.count) })),
-      signupAttribution: signupAttribution.map((r) => ({
-        name: String(r.name),
-        count: num(r.count),
-      })),
+      planDistribution: planDistribution.map((r) => ({ tier: str(r.tier), count: num(r.count) })),
+      topOrgs: topOrgs.map((r) => ({ id: str(r.id), name: str(r.name) || "(unnamed)", count: num(r.count) })),
+      topErrors: topErrors.map((r) => ({ name: str(r.name), count: num(r.count) })),
+      signupAttribution: signupAttribution.map((r) => ({ name: str(r.name), count: num(r.count) })),
       monthlyUsage: monthlyUsage
-        .map((r) => ({ period: String(r.period), count: num(r.count) }))
+        .map((r) => ({ period: str(r.period), count: num(r.count) }))
         .reverse(),
+    };
+  });
+}
+
+/* ------------------------------- orgs -------------------------------- */
+
+export type OrgListRow = {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt: string;
+  members: number;
+  accounts: number;
+  posts: number;
+  tier: string | null;
+};
+
+export async function listOrgs(): Promise<OrgListRow[]> {
+  return readonly(async (tx) => {
+    // Pre-aggregate each child table once and hash-join, instead of running
+    // correlated subqueries per org row.
+    const rows = await tx<Row[]>`
+      SELECT o.id, o.name, o.slug, o.created_at::text AS created_at,
+        coalesce(mc.n, 0) AS members,
+        coalesce(ac.n, 0) AS accounts,
+        coalesce(pc.n, 0) AS posts,
+        bs.tier
+      FROM organization o
+      LEFT JOIN (SELECT organization_id, count(*) AS n FROM member GROUP BY 1) mc ON mc.organization_id = o.id
+      LEFT JOIN (SELECT organization_id, count(*) AS n FROM platform_accounts GROUP BY 1) ac ON ac.organization_id = o.id
+      LEFT JOIN (SELECT organization_id, count(*) AS n FROM posts GROUP BY 1) pc ON pc.organization_id = o.id
+      LEFT JOIN billing_subscriptions bs ON bs.organization_id = o.id
+      ORDER BY o.created_at DESC LIMIT 500
+    `;
+    return rows.map((r) => ({
+      id: str(r.id),
+      name: str(r.name) || "(unnamed)",
+      slug: str(r.slug),
+      createdAt: str(r.created_at),
+      members: num(r.members),
+      accounts: num(r.accounts),
+      posts: num(r.posts),
+      tier: strn(r.tier),
+    }));
+  });
+}
+
+export type OrgMember = {
+  userId: string;
+  name: string;
+  email: string;
+  emailVerified: boolean;
+  role: string;
+  joinedAt: string;
+};
+export type OrgAccount = {
+  id: string;
+  platform: string;
+  displayName: string | null;
+  platformAccountId: string;
+  tokenExpiresAt: string | null;
+  createdAt: string;
+};
+export type OrgPost = {
+  id: string;
+  status: string;
+  text: string;
+  platform: string | null;
+  createdAt: string;
+  publishedAt: string | null;
+};
+export type OrgDetail = {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt: string;
+  tier: string | null;
+  subStatus: string | null;
+  periodEnd: string | null;
+  members: OrgMember[];
+  accounts: OrgAccount[];
+  statusCounts: StatusCount[];
+  totalPosts: number;
+  recentPosts: OrgPost[];
+  usage: MonthlyUsage[];
+};
+
+export async function getOrgDetail(id: string): Promise<OrgDetail | null> {
+  return readonly(async (tx) => {
+    const [orgRows, subRows, members, accounts, statusCounts, totalRows, recent, usage] =
+      await Promise.all([
+        tx<Row[]>`SELECT id, name, slug, created_at::text AS created_at FROM organization WHERE id = ${id}`,
+        tx<Row[]>`SELECT tier, status, current_period_end::text AS period_end FROM billing_subscriptions WHERE organization_id = ${id}`,
+        tx<Row[]>`
+          SELECT u.id AS user_id, u.name, u.email, u.email_verified, m.role, m.created_at::text AS joined_at
+          FROM member m JOIN "user" u ON u.id = m.user_id
+          WHERE m.organization_id = ${id}
+          ORDER BY (m.role = 'owner') DESC, m.created_at ASC
+        `,
+        tx<Row[]>`
+          SELECT id, platform, display_name, platform_account_id,
+            token_expires_at::text AS token_expires_at, created_at::text AS created_at
+          FROM platform_accounts WHERE organization_id = ${id} ORDER BY created_at ASC
+        `,
+        tx<Row[]>`
+          SELECT status, count(*) AS count FROM posts WHERE organization_id = ${id} GROUP BY status ORDER BY count DESC
+        `,
+        tx<Row[]>`SELECT count(*) AS total FROM posts WHERE organization_id = ${id}`,
+        tx<Row[]>`
+          SELECT p.id, p.status, p.text, pa.platform,
+            p.created_at::text AS created_at, p.published_at::text AS published_at
+          FROM posts p LEFT JOIN platform_accounts pa ON pa.id = p.account_id
+          WHERE p.organization_id = ${id} ORDER BY p.created_at DESC LIMIT 20
+        `,
+        tx<Row[]>`
+          SELECT period, posts_count AS count FROM billing_usage
+          WHERE organization_id = ${id} ORDER BY period DESC LIMIT 6
+        `,
+      ]);
+
+    const org = orgRows[0];
+    if (!org) return null;
+    const sub = subRows[0];
+
+    return {
+      id: str(org.id),
+      name: str(org.name) || "(unnamed)",
+      slug: str(org.slug),
+      createdAt: str(org.created_at),
+      tier: sub ? strn(sub.tier) : null,
+      subStatus: sub ? strn(sub.status) : null,
+      periodEnd: sub ? strn(sub.period_end) : null,
+      members: members.map((r) => ({
+        userId: str(r.user_id),
+        name: str(r.name),
+        email: str(r.email),
+        emailVerified: bool(r.email_verified),
+        role: str(r.role),
+        joinedAt: str(r.joined_at),
+      })),
+      accounts: accounts.map((r) => ({
+        id: str(r.id),
+        platform: str(r.platform),
+        displayName: strn(r.display_name),
+        platformAccountId: str(r.platform_account_id),
+        tokenExpiresAt: strn(r.token_expires_at),
+        createdAt: str(r.created_at),
+      })),
+      statusCounts: statusCounts.map((r) => ({ status: str(r.status), count: num(r.count) })),
+      totalPosts: num(totalRows[0].total),
+      recentPosts: recent.map((r) => ({
+        id: str(r.id),
+        status: str(r.status),
+        text: str(r.text),
+        platform: strn(r.platform),
+        createdAt: str(r.created_at),
+        publishedAt: strn(r.published_at),
+      })),
+      usage: usage.map((r) => ({ period: str(r.period), count: num(r.count) })).reverse(),
+    };
+  });
+}
+
+/* ------------------------------- users ------------------------------- */
+
+export type UserListRow = {
+  id: string;
+  name: string;
+  email: string;
+  emailVerified: boolean;
+  createdAt: string;
+  signupSource: string | null;
+};
+
+export async function listUsers(): Promise<UserListRow[]> {
+  return readonly(async (tx) => {
+    const rows = await tx<Row[]>`
+      SELECT id, name, email, email_verified, created_at::text AS created_at, signup_source
+      FROM "user" ORDER BY created_at DESC LIMIT 500
+    `;
+    return rows.map((r) => ({
+      id: str(r.id),
+      name: str(r.name),
+      email: str(r.email),
+      emailVerified: bool(r.email_verified),
+      createdAt: str(r.created_at),
+      signupSource: strn(r.signup_source),
+    }));
+  });
+}
+
+export type UserOrg = { id: string; name: string; role: string; joinedAt: string };
+export type UserSession = {
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  ip: string | null;
+  userAgent: string | null;
+};
+export type UserDetail = {
+  id: string;
+  name: string;
+  email: string;
+  emailVerified: boolean;
+  createdAt: string;
+  signupSource: string | null;
+  signupReferrer: string | null;
+  signupLandingPath: string | null;
+  utmSource: string | null;
+  utmMedium: string | null;
+  utmCampaign: string | null;
+  orgs: UserOrg[];
+  sessions: UserSession[];
+};
+
+export async function getUserDetail(id: string): Promise<UserDetail | null> {
+  return readonly(async (tx) => {
+    const [userRows, orgs, sessions] = await Promise.all([
+      tx<Row[]>`
+        SELECT id, name, email, email_verified, created_at::text AS created_at,
+          signup_source, signup_referrer, signup_landing_path,
+          signup_utm_source, signup_utm_medium, signup_utm_campaign
+        FROM "user" WHERE id = ${id}
+      `,
+      tx<Row[]>`
+        SELECT o.id, o.name, m.role, m.created_at::text AS joined_at
+        FROM member m JOIN organization o ON o.id = m.organization_id
+        WHERE m.user_id = ${id} ORDER BY m.created_at ASC
+      `,
+      tx<Row[]>`
+        SELECT created_at::text AS created_at, updated_at::text AS updated_at,
+          expires_at::text AS expires_at, ip_address, user_agent
+        FROM session WHERE user_id = ${id} ORDER BY updated_at DESC LIMIT 10
+      `,
+    ]);
+
+    const u = userRows[0];
+    if (!u) return null;
+
+    return {
+      id: str(u.id),
+      name: str(u.name),
+      email: str(u.email),
+      emailVerified: bool(u.email_verified),
+      createdAt: str(u.created_at),
+      signupSource: strn(u.signup_source),
+      signupReferrer: strn(u.signup_referrer),
+      signupLandingPath: strn(u.signup_landing_path),
+      utmSource: strn(u.signup_utm_source),
+      utmMedium: strn(u.signup_utm_medium),
+      utmCampaign: strn(u.signup_utm_campaign),
+      orgs: orgs.map((r) => ({
+        id: str(r.id),
+        name: str(r.name) || "(unnamed)",
+        role: str(r.role),
+        joinedAt: str(r.joined_at),
+      })),
+      sessions: sessions.map((r) => ({
+        createdAt: str(r.created_at),
+        updatedAt: str(r.updated_at),
+        expiresAt: str(r.expires_at),
+        ip: strn(r.ip_address),
+        userAgent: strn(r.user_agent),
+      })),
+    };
+  });
+}
+
+/* ------------------------------- posts ------------------------------- */
+
+export type PostAttempt = {
+  attemptNumber: number;
+  startedAt: string;
+  finishedAt: string | null;
+  succeeded: boolean | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+};
+export type PostDetail = {
+  id: string;
+  status: string;
+  text: string;
+  orgId: string;
+  orgName: string;
+  platform: string | null;
+  accountName: string | null;
+  accountId: string | null;
+  scheduledAt: string | null;
+  publishedAt: string | null;
+  createdAt: string;
+  platformUri: string | null;
+  platformCid: string | null;
+  error: unknown;
+  attempts: PostAttempt[];
+};
+
+export async function getPostDetail(id: string): Promise<PostDetail | null> {
+  return readonly(async (tx) => {
+    const [postRows, attempts] = await Promise.all([
+      tx<Row[]>`
+        SELECT p.id, p.status, p.text, p.organization_id, o.name AS org_name,
+          pa.platform, pa.display_name AS account_name, p.account_id,
+          p.scheduled_at::text AS scheduled_at, p.published_at::text AS published_at,
+          p.created_at::text AS created_at, p.platform_uri, p.platform_cid, p.error
+        FROM posts p
+        JOIN organization o ON o.id = p.organization_id
+        LEFT JOIN platform_accounts pa ON pa.id = p.account_id
+        WHERE p.id = ${id}
+      `,
+      tx<Row[]>`
+        SELECT attempt_number, started_at::text AS started_at, finished_at::text AS finished_at,
+          succeeded, error_code, error_message
+        FROM post_attempts WHERE post_id = ${id} ORDER BY attempt_number ASC
+      `,
+    ]);
+
+    const p = postRows[0];
+    if (!p) return null;
+
+    return {
+      id: str(p.id),
+      status: str(p.status),
+      text: str(p.text),
+      orgId: str(p.organization_id),
+      orgName: str(p.org_name) || "(unnamed)",
+      platform: strn(p.platform),
+      accountName: strn(p.account_name),
+      accountId: strn(p.account_id),
+      scheduledAt: strn(p.scheduled_at),
+      publishedAt: strn(p.published_at),
+      createdAt: str(p.created_at),
+      platformUri: strn(p.platform_uri),
+      platformCid: strn(p.platform_cid),
+      error: p.error ?? null,
+      attempts: attempts.map((r) => ({
+        attemptNumber: num(r.attempt_number),
+        startedAt: str(r.started_at),
+        finishedAt: strn(r.finished_at),
+        succeeded: r.succeeded == null ? null : bool(r.succeeded),
+        errorCode: strn(r.error_code),
+        errorMessage: strn(r.error_message),
+      })),
     };
   });
 }

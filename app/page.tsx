@@ -1,10 +1,15 @@
+import { Suspense } from "react";
+import Link from "next/link";
 import { getDashboardData } from "@/lib/metrics";
+import { resolveRange, isoDate } from "@/lib/range";
+import { AppHeader } from "@/components/app-header";
+import { DateRangePicker } from "@/components/date-range-picker";
 import { Card, CardContent, CardHeader, CardTitle, Badge, type Tone } from "@/components/ui";
 import { StatCard } from "@/components/stat-card";
 import { MetricTable } from "@/components/metric-table";
 import { SignupsChart } from "@/components/charts/signups-chart";
 import { PostsChart } from "@/components/charts/posts-chart";
-import { fmt, pct, signed } from "@/lib/utils";
+import { fmt, pct } from "@/lib/utils";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,23 +22,43 @@ function statusTone(status: string): Tone {
   if (status === "published") return "green";
   if (status === "failed" || status === "rejected") return "red";
   if (status === "canceled") return "neutral";
-  return "amber"; // queued / validated / publishing
+  return "amber";
 }
 
-export default async function Page() {
+function first(v: string | string[] | undefined): string | undefined {
+  return Array.isArray(v) ? v[0] : v;
+}
+
+export default async function Page({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const sp = await searchParams;
+  const range = resolveRange({
+    range: first(sp.range),
+    from: first(sp.from),
+    to: first(sp.to),
+  });
+
   let data;
   try {
-    data = await getDashboardData();
+    data = await getDashboardData(range);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return (
-      <main className="mx-auto max-w-2xl px-5 py-16">
+      <main className="mx-auto max-w-6xl px-5 py-8">
+        <AppHeader active="dashboard">
+          <Suspense fallback={null}>
+            <DateRangePicker />
+          </Suspense>
+        </AppHeader>
         <Card className="p-6">
           <CardTitle className="text-red-400">Couldn&apos;t load metrics</CardTitle>
           <p className="mt-2 text-sm text-neutral-400">
-            The dashboard reached the app but the database query failed. Check
-            that <code className="text-neutral-200">DATABASE_URL</code> is set
-            and reachable.
+            The query failed. Check that{" "}
+            <code className="text-neutral-200">DATABASE_URL</code> is set and
+            reachable.
           </p>
           <pre className="mt-3 overflow-x-auto rounded-lg bg-neutral-950 p-3 text-xs text-red-300">
             {message}
@@ -44,68 +69,53 @@ export default async function Page() {
   }
 
   const k = data.kpis;
-  const generatedAt = new Date().toUTCString();
+  const rangeLabel =
+    range.preset === "custom"
+      ? `${isoDate(range.from)} → ${isoDate(range.to)}`
+      : `last ${range.preset}`;
 
   return (
     <main className="mx-auto max-w-6xl px-5 py-8">
-      <header className="mb-6 flex flex-wrap items-baseline justify-between gap-2">
-        <div>
-          <h1 className="text-xl font-semibold text-neutral-50">
-            letmepost <span className="text-neutral-500">· admin</span>
-          </h1>
-          <p className="tnum mt-0.5 text-xs text-neutral-600">
-            live · read-only · generated {generatedAt}
-          </p>
-        </div>
-        <a
-          href="/api/logout"
-          className="text-xs text-neutral-500 underline-offset-2 hover:text-neutral-300 hover:underline"
-        >
-          Sign out
-        </a>
-      </header>
+      <AppHeader active="dashboard">
+        <Suspense fallback={null}>
+          <DateRangePicker />
+        </Suspense>
+      </AppHeader>
 
-      {/* KPIs */}
+      {/* Stock totals */}
+      <div className="mb-2 text-xs uppercase tracking-wide text-neutral-500">
+        Totals (cumulative)
+      </div>
       <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <StatCard
-          label="Users"
-          value={k.totalUsers}
-          sub={`${signed(k.newUsers7d)} this week`}
-          tone={k.newUsers7d > 0 ? "green" : "neutral"}
-        />
+        <StatCard label="Total users" value={k.totalUsers} />
         <StatCard label="Organizations" value={k.totalOrgs} />
         <StatCard label="Connected accounts" value={k.totalAccounts} />
-        <StatCard
-          label="Posts"
-          value={k.totalPosts}
-          sub={`${signed(k.posts7d)} this week`}
-          tone={k.posts7d > 0 ? "green" : "neutral"}
-        />
-        <StatCard label="Published" value={k.published} tone="green" />
-        <StatCard
-          label="Failed / rejected"
-          value={k.failed}
-          tone={k.failed > 0 ? "red" : "neutral"}
-        />
-        <StatCard label="Success rate" value={pct(k.successRate)} />
-        <StatCard
-          label="Active users (7d)"
-          value={k.activeUsers7d}
-          sub={`${fmt(k.liveSessions)} live sessions`}
-        />
+        <StatCard label="Live sessions" value={k.liveSessions} />
       </section>
 
+      {/* Flow metrics */}
+      <div className="mt-6 mb-2 text-xs uppercase tracking-wide text-neutral-500">
+        In range · {rangeLabel}
+      </div>
+      <section className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+        <StatCard label="New signups" value={k.newUsers} />
+        <StatCard label="Posts created" value={k.postsCreated} />
+        <StatCard label="Published" value={k.published} tone="green" />
+        <StatCard label="Failed / rejected" value={k.failed} tone={k.failed > 0 ? "red" : "neutral"} />
+        <StatCard label="Success rate" value={pct(k.successRate)} />
+        <StatCard label="Active users" value={k.activeUsers} />
+      </section>
       <p className="mt-2 text-xs text-neutral-600">
-        Active users = distinct users with a session active in the last 7 days.
-        Posts aren&apos;t tied to a user, so per-user posting activity
-        isn&apos;t available.
+        Active users = distinct users with a session active in the range. Posts
+        aren&apos;t tied to a user, so per-user posting activity isn&apos;t
+        available.
       </p>
 
       {/* Charts */}
       <section className="mt-6 grid gap-3 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Signups · last 30 days</CardTitle>
+            <CardTitle>Signups · {rangeLabel}</CardTitle>
           </CardHeader>
           <CardContent>
             <SignupsChart data={data.signupsDaily} />
@@ -113,7 +123,7 @@ export default async function Page() {
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>Posts · created vs published · last 30 days</CardTitle>
+            <CardTitle>Posts · created vs published · {rangeLabel}</CardTitle>
           </CardHeader>
           <CardContent>
             <PostsChart data={data.postsDaily} />
@@ -134,8 +144,7 @@ export default async function Page() {
             />
             {data.unattributedPosts > 0 && (
               <p className="mt-2 text-xs text-neutral-600">
-                {fmt(data.unattributedPosts)} unattributed (account since
-                deleted).
+                {fmt(data.unattributedPosts)} unattributed (account since deleted).
               </p>
             )}
           </CardContent>
@@ -201,7 +210,17 @@ export default async function Page() {
           <CardContent>
             <MetricTable
               head={["Org", "Posts"]}
-              rows={data.topOrgs.map((r) => [r.name, fmt(r.count)])}
+              rows={data.topOrgs.map((r) => [
+                <Link
+                  key={r.id}
+                  href={`/orgs/${r.id}`}
+                  className="text-neutral-200 hover:text-emerald-400 hover:underline"
+                >
+                  {r.name}
+                </Link>,
+                fmt(r.count),
+              ])}
+              empty="No posts in this range."
             />
           </CardContent>
         </Card>
@@ -219,7 +238,7 @@ export default async function Page() {
                 </span>,
                 fmt(r.count),
               ])}
-              empty="No failed attempts recorded."
+              empty="No failed attempts in this range."
             />
           </CardContent>
         </Card>
@@ -232,6 +251,7 @@ export default async function Page() {
             <MetricTable
               head={["Source", "Users"]}
               rows={data.signupAttribution.map((r) => [r.name, fmt(r.count)])}
+              empty="No signups in this range."
             />
           </CardContent>
         </Card>
