@@ -1,6 +1,14 @@
 import "server-only";
+import type postgres from "postgres";
 import { readonly } from "@/lib/db";
 import type { Range } from "@/lib/range";
+import type {
+  OrgListParams,
+  OrgSort,
+  SortDir,
+  UserListParams,
+  UserSort,
+} from "@/lib/list-params";
 
 // All product metrics + entity detail queries. Every function runs inside a
 // single read-only transaction (see lib/db `readonly`), and issues its
@@ -19,10 +27,21 @@ import type { Range } from "@/lib/range";
 // session-based.
 
 type Row = Record<string, unknown>;
+type TxSql = postgres.TransactionSql;
 const num = (v: unknown): number => (v == null ? 0 : Number(v));
 const str = (v: unknown): string => (v == null ? "" : String(v));
 const strn = (v: unknown): string | null => (v == null ? null : String(v));
 const bool = (v: unknown): boolean => v === true || v === "t" || v === "true";
+
+// json_agg output for the {id,name} org refs joined onto a user row.
+const orgRefs = (v: unknown): { id: string; name: string }[] => {
+  if (!Array.isArray(v)) return [];
+  return v.flatMap((o) => {
+    if (o == null || typeof o !== "object") return [];
+    const r = o as Row;
+    return [{ id: str(r.id), name: str(r.name) || "(unnamed)" }];
+  });
+};
 
 /* ------------------------------- types ------------------------------- */
 
@@ -238,35 +257,124 @@ export type OrgListRow = {
   accounts: number;
   posts: number;
   tier: string | null;
+  subStatus: string | null;
+  owner: { id: string; name: string; email: string } | null;
 };
 
-export async function listOrgs(): Promise<OrgListRow[]> {
+export type OrgListResult = {
+  rows: OrgListRow[];
+  total: number;
+};
+
+/** See userOrderBy — whitelisted fragments, never interpolated identifiers. */
+function orgOrderBy(tx: TxSql, sort: OrgSort, dir: SortDir) {
+  const asc = dir === "asc";
+  switch (sort) {
+    case "name":
+      return asc
+        ? tx`ORDER BY o.name ASC NULLS LAST, o.created_at DESC`
+        : tx`ORDER BY o.name DESC NULLS LAST, o.created_at DESC`;
+    case "members":
+      return asc ? tx`ORDER BY members ASC` : tx`ORDER BY members DESC`;
+    case "accounts":
+      return asc ? tx`ORDER BY accounts ASC` : tx`ORDER BY accounts DESC`;
+    case "posts":
+      return asc ? tx`ORDER BY posts ASC` : tx`ORDER BY posts DESC`;
+    default:
+      return asc ? tx`ORDER BY o.created_at ASC` : tx`ORDER BY o.created_at DESC`;
+  }
+}
+
+export type OrgsPageData = OrgListResult & {
+  tiers: string[];
+  statuses: string[];
+  /** Label for the ?user= cross-filter banner; null when not filtering. */
+  userLabel: string | null;
+};
+
+/** Everything the /orgs page needs, in one read-only transaction. */
+export async function getOrgsPageData(
+  p: OrgListParams,
+): Promise<OrgsPageData> {
   return readonly(async (tx) => {
+    const conds = [tx`TRUE`];
+    if (p.q) {
+      const like = `%${p.q}%`;
+      conds.push(tx`(o.name ILIKE ${like} OR o.slug ILIKE ${like})`);
+    }
+    if (p.tier) conds.push(tx`bs.tier = ${p.tier}`);
+    if (p.status) conds.push(tx`bs.status = ${p.status}`);
+    if (p.userId) {
+      conds.push(
+        tx`EXISTS (SELECT 1 FROM member m WHERE m.organization_id = o.id AND m.user_id = ${p.userId})`,
+      );
+    }
+    const where = conds.reduce((a, b) => tx`${a} AND ${b}`);
+
     // Pre-aggregate each child table once and hash-join, instead of running
-    // correlated subqueries per org row.
-    const rows = await tx<Row[]>`
-      SELECT o.id, o.name, o.slug, o.created_at::text AS created_at,
-        coalesce(mc.n, 0) AS members,
-        coalesce(ac.n, 0) AS accounts,
-        coalesce(pc.n, 0) AS posts,
-        bs.tier
+    // correlated subqueries per org row. The counts are also sortable, so they
+    // have to live in the SELECT rather than a lateral per row.
+    const base = tx`
       FROM organization o
       LEFT JOIN (SELECT organization_id, count(*) AS n FROM member GROUP BY 1) mc ON mc.organization_id = o.id
       LEFT JOIN (SELECT organization_id, count(*) AS n FROM platform_accounts GROUP BY 1) ac ON ac.organization_id = o.id
       LEFT JOIN (SELECT organization_id, count(*) AS n FROM posts GROUP BY 1) pc ON pc.organization_id = o.id
       LEFT JOIN billing_subscriptions bs ON bs.organization_id = o.id
-      ORDER BY o.created_at DESC LIMIT 500
+      WHERE ${where}
     `;
-    return rows.map((r) => ({
-      id: str(r.id),
-      name: str(r.name) || "(unnamed)",
-      slug: str(r.slug),
-      createdAt: str(r.created_at),
-      members: num(r.members),
-      accounts: num(r.accounts),
-      posts: num(r.posts),
-      tier: strn(r.tier),
-    }));
+
+    const [rows, countRows, tierRows, statusRows, userRows] = await Promise.all([
+      tx<Row[]>`
+        SELECT o.id, o.name, o.slug, o.created_at::text AS created_at,
+          coalesce(mc.n, 0) AS members,
+          coalesce(ac.n, 0) AS accounts,
+          coalesce(pc.n, 0) AS posts,
+          bs.tier, bs.status AS sub_status,
+          ow.id AS owner_id, ow.name AS owner_name, ow.email AS owner_email
+        ${base}
+        LEFT JOIN LATERAL (
+          SELECT u.id, u.name, u.email
+          FROM member m JOIN "user" u ON u.id = m.user_id
+          WHERE m.organization_id = o.id AND m.role = 'owner'
+          ORDER BY m.created_at ASC
+          LIMIT 1
+        ) ow ON TRUE
+        ${orgOrderBy(tx, p.sort, p.dir)}
+        LIMIT ${p.perPage} OFFSET ${(p.page - 1) * p.perPage}
+      `,
+      tx<Row[]>`SELECT count(*) AS total ${base}`,
+      tx<Row[]>`SELECT DISTINCT tier FROM billing_subscriptions WHERE tier IS NOT NULL AND tier <> '' ORDER BY tier`,
+      tx<Row[]>`SELECT DISTINCT status FROM billing_subscriptions WHERE status IS NOT NULL AND status <> '' ORDER BY status`,
+      p.userId
+        ? tx<Row[]>`SELECT name, email FROM "user" WHERE id = ${p.userId}`
+        : Promise.resolve([] as Row[]),
+    ]);
+
+    const u = userRows[0];
+    return {
+      total: num(countRows[0]?.total),
+      tiers: tierRows.map((r) => str(r.tier)),
+      statuses: statusRows.map((r) => str(r.status)),
+      userLabel: u ? str(u.email) || str(u.name) || "(no name)" : null,
+      rows: rows.map((r) => ({
+        id: str(r.id),
+        name: str(r.name) || "(unnamed)",
+        slug: str(r.slug),
+        createdAt: str(r.created_at),
+        members: num(r.members),
+        accounts: num(r.accounts),
+        posts: num(r.posts),
+        tier: strn(r.tier),
+        subStatus: strn(r.sub_status),
+        owner: r.owner_id
+          ? {
+              id: str(r.owner_id),
+              name: str(r.owner_name),
+              email: str(r.owner_email),
+            }
+          : null,
+      })),
+    };
   });
 }
 
@@ -395,22 +503,108 @@ export type UserListRow = {
   emailVerified: boolean;
   createdAt: string;
   signupSource: string | null;
+  orgs: { id: string; name: string }[];
 };
 
-export async function listUsers(): Promise<UserListRow[]> {
+export type UserListResult = {
+  rows: UserListRow[];
+  total: number;
+};
+
+/**
+ * Sort clause for the users list. Built as whole whitelisted fragments rather
+ * than interpolating a column name — `sort`/`dir` come off the query string, so
+ * nothing user-controlled may reach the SQL text.
+ */
+function userOrderBy(tx: TxSql, sort: UserSort, dir: SortDir) {
+  const asc = dir === "asc";
+  switch (sort) {
+    case "name":
+      return asc
+        ? tx`ORDER BY u.name ASC NULLS LAST, u.created_at DESC`
+        : tx`ORDER BY u.name DESC NULLS LAST, u.created_at DESC`;
+    case "email":
+      return asc ? tx`ORDER BY u.email ASC` : tx`ORDER BY u.email DESC`;
+    default:
+      return asc ? tx`ORDER BY u.created_at ASC` : tx`ORDER BY u.created_at DESC`;
+  }
+}
+
+function userWhere(tx: TxSql, p: UserListParams) {
+  const conds = [tx`TRUE`];
+  if (p.q) {
+    const like = `%${p.q}%`;
+    conds.push(tx`(u.name ILIKE ${like} OR u.email ILIKE ${like})`);
+  }
+  if (p.verified === "yes") conds.push(tx`u.email_verified IS TRUE`);
+  if (p.verified === "no") conds.push(tx`u.email_verified IS NOT TRUE`);
+  if (p.source) conds.push(tx`u.signup_source = ${p.source}`);
+  if (p.orgId) {
+    conds.push(
+      tx`EXISTS (SELECT 1 FROM member m WHERE m.user_id = u.id AND m.organization_id = ${p.orgId})`,
+    );
+  }
+  return conds.reduce((a, b) => tx`${a} AND ${b}`);
+}
+
+export type UsersPageData = UserListResult & {
+  /** Distinct signup sources, for the filter dropdown. */
+  sources: string[];
+  /** Label for the ?org= cross-filter banner; null when not filtering. */
+  orgName: string | null;
+};
+
+/**
+ * Everything the /users page needs, in one read-only transaction so the four
+ * queries pipeline over a single connection (the pool is only 3 wide — a query
+ * per helper would starve concurrent page loads).
+ */
+export async function getUsersPageData(
+  p: UserListParams,
+): Promise<UsersPageData> {
   return readonly(async (tx) => {
-    const rows = await tx<Row[]>`
-      SELECT id, name, email, email_verified, created_at::text AS created_at, signup_source
-      FROM "user" ORDER BY created_at DESC LIMIT 500
-    `;
-    return rows.map((r) => ({
-      id: str(r.id),
-      name: str(r.name),
-      email: str(r.email),
-      emailVerified: bool(r.email_verified),
-      createdAt: str(r.created_at),
-      signupSource: strn(r.signup_source),
-    }));
+    const where = userWhere(tx, p);
+
+    const [rows, countRows, sourceRows, orgRows] = await Promise.all([
+      tx<Row[]>`
+        SELECT u.id, u.name, u.email, u.email_verified,
+          u.created_at::text AS created_at, u.signup_source,
+          coalesce(uo.orgs, '[]'::json) AS orgs
+        FROM "user" u
+        LEFT JOIN LATERAL (
+          SELECT json_agg(json_build_object('id', o.id, 'name', o.name) ORDER BY o.name) AS orgs
+          FROM member m JOIN organization o ON o.id = m.organization_id
+          WHERE m.user_id = u.id
+        ) uo ON TRUE
+        WHERE ${where}
+        ${userOrderBy(tx, p.sort, p.dir)}
+        LIMIT ${p.perPage} OFFSET ${(p.page - 1) * p.perPage}
+      `,
+      tx<Row[]>`SELECT count(*) AS total FROM "user" u WHERE ${where}`,
+      tx<Row[]>`
+        SELECT DISTINCT signup_source FROM "user"
+        WHERE signup_source IS NOT NULL AND signup_source <> ''
+        ORDER BY signup_source
+      `,
+      p.orgId
+        ? tx<Row[]>`SELECT name FROM organization WHERE id = ${p.orgId}`
+        : Promise.resolve([] as Row[]),
+    ]);
+
+    return {
+      total: num(countRows[0]?.total),
+      sources: sourceRows.map((r) => str(r.signup_source)),
+      orgName: orgRows[0] ? str(orgRows[0].name) || "(unnamed)" : null,
+      rows: rows.map((r) => ({
+        id: str(r.id),
+        name: str(r.name),
+        email: str(r.email),
+        emailVerified: bool(r.email_verified),
+        createdAt: str(r.created_at),
+        signupSource: strn(r.signup_source),
+        orgs: orgRefs(r.orgs),
+      })),
+    };
   });
 }
 
