@@ -7,6 +7,7 @@ import { DataTable } from "@/components/data-table";
 import { DetailList } from "@/components/detail-list";
 import { ErrorCard } from "@/components/error-card";
 import { fmt, fmtDate, fmtDateTime, truncate } from "@/lib/utils";
+import { ImpersonateButton } from "./impersonate-button";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,10 +39,15 @@ export default async function UserDetailPage({
       <Link href="/users" className="text-xs text-neutral-500 hover:text-neutral-300">
         ← Users
       </Link>
-      <h1 className="mt-1 text-xl font-semibold text-neutral-50">
-        {user.name || "(no name)"}
-      </h1>
-      <p className="text-sm text-neutral-400">{user.email}</p>
+      <div className="mt-1 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold text-neutral-50">
+            {user.name || "(no name)"}
+          </h1>
+          <p className="text-sm text-neutral-400">{user.email}</p>
+        </div>
+        <ImpersonateButton userId={user.id} email={user.email} />
+      </div>
 
       <Card className="mt-4 p-5">
         <DetailList
@@ -68,8 +74,14 @@ export default async function UserDetailPage({
       </Card>
 
       <Card className="mt-4">
-        <CardHeader>
+        <CardHeader className="flex items-baseline justify-between gap-3">
           <CardTitle>Organizations ({fmt(user.orgs.length)})</CardTitle>
+          <Link
+            href={`/orgs?user=${id}`}
+            className="text-xs text-neutral-500 hover:text-emerald-400 hover:underline"
+          >
+            in orgs list →
+          </Link>
         </CardHeader>
         <CardContent>
           <DataTable

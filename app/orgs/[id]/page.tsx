@@ -77,8 +77,14 @@ export default async function OrgDetailPage({
 
       <section className="mt-4 grid gap-3 lg:grid-cols-2">
         <Card>
-          <CardHeader>
+          <CardHeader className="flex items-baseline justify-between gap-3">
             <CardTitle>Members ({fmt(org.members.length)})</CardTitle>
+            <Link
+              href={`/users?org=${id}`}
+              className="text-xs text-neutral-500 hover:text-emerald-400 hover:underline"
+            >
+              in users list →
+            </Link>
           </CardHeader>
           <CardContent>
             <DataTable
